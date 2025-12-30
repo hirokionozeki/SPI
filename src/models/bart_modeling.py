@@ -85,22 +85,8 @@ BART_PRETRAINED_MODEL_ARCHIVE_LIST = [
     # see all BART models at https://huggingface.co/models?filter=bart
 ]
 
-
-
-
-"""
-改変部
-"""
-import os
-import json
-import numpy as np
-import random
-# with open("data/triviascore_list/test_use_triviascore_list.json") as f:
-#     use_triviascore_list = json.load(f)
 arc_logit_list = []
 all_storage_data_dict = {}
-
-# データの大きさに基づいてソートされたインデックスのリストを返す
 def get_sorted_indices(data_list):
     return sorted(range(len(data_list)), key=lambda x: data_list[x], reverse=True)
 
@@ -1643,34 +1629,11 @@ class BartModelWithLangevin(BartPretrainedModel, LatentModel):
         # kn_select_index = torch.argmax(classification_logits.unsqueeze(-1), dim=1).unsqueeze(-1)  # bsz x 1 x 1
         top_k = min(self.top_k_kn, n_kns) if self.training else 1
 
-
-
-        """
-        改変部
-        ここで出力ロジットが最大の知識を１つ選択している
-        classification_logitは一致している
-        多分、選択した知識のインデックス以外をマスクするようになっているから、スコアに応じて選択するインデックスを変更するだけでいい
-        [[[2]]]
-
-        元は以下の１行のみ
-        """
-
-        # 元々の知識選択
-        # kn_select_index = torch.topk(classification_logits, top_k, dim=1).indices.unsqueeze(-1)  # bsz x top_k x 1
-
-        # 指定した知識を選択する
         kn_select_idx_int = select_knowledge_index.tolist()
         if kn_select_idx_int == -1:
             kn_select_index = torch.topk(classification_logits, top_k, dim=1).indices.unsqueeze(-1)
         else:
             kn_select_index = torch.tensor([kn_select_idx_int], device=classification_logits.device).unsqueeze(-1).unsqueeze(0)
-        # print("\n\nttt")
-        # print(kn_select_index)
-
-
-        """
-        ここまで
-        """
 
         # Ours: Forward for Prior Model
         # Latent model forward here
