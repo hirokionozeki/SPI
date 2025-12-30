@@ -86,6 +86,26 @@ BART_PRETRAINED_MODEL_ARCHIVE_LIST = [
 ]
 
 
+
+
+"""
+改変部
+"""
+import os
+import json
+import numpy as np
+import random
+# with open("data/triviascore_list/test_use_triviascore_list.json") as f:
+#     use_triviascore_list = json.load(f)
+arc_logit_list = []
+all_storage_data_dict = {}
+
+# データの大きさに基づいてソートされたインデックスのリストを返す
+def get_sorted_indices(data_list):
+    return sorted(range(len(data_list)), key=lambda x: data_list[x], reverse=True)
+
+
+
 def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int, decoder_start_token_id: int):
     """
     Shift input ids one token to the right.
@@ -813,6 +833,7 @@ class BartEncoder(BartPretrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        select_knowledge_index: Optional[torch.LongTensor] = None,  # Ours
     ) -> Union[Tuple, BaseModelOutput]:
         r"""
         Args:
@@ -867,7 +888,7 @@ class BartEncoder(BartPretrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids) * self.embed_scale
 
-        embed_pos = self.embed_positions(input_shape)
+        embed_pos = self.embed_positions(input_ids)
 
         hidden_states = inputs_embeds + embed_pos
         hidden_states = self.layernorm_embedding(hidden_states)
@@ -1006,8 +1027,6 @@ class BartModelWithLV(BartPretrainedModel, LatentModel):
         return self.decoder
     
     def transform_z_to_latent_context(self, z):
-        # Modified from 
-        # https://github.com/lemuria-wchen/DialogVED/blob/23177dfeecff831c1417fc661e75f8947fffba5d/src/model.py#L1118
         # Transform to latent key and value
         # latent_context: [bsz, 1, latent_dim]
         latent_context = self.self_attn_transform(z).chunk(2, -1)
@@ -1502,7 +1521,6 @@ class BartModelWithLangevin(BartPretrainedModel, LatentModel):
         self.use_feature   = config.use_feature
         self.use_z_for_cls = config.use_z_for_cls
         self.top_k_kn      = config.top_k_kn
-        self.oracle        = config.oracle
 
         assert self.top_k_kn >= 1
 
@@ -1550,8 +1568,8 @@ class BartModelWithLangevin(BartPretrainedModel, LatentModel):
         ctx_attention_mask: Optional[torch.Tensor] = None,
         decoder_shapes: Optional[tuple] = None,
         decoder_cls_mask: Optional[torch.Tensor] = None,
+        select_knowledge_index: Optional[torch.Tensor] = None, # Ours
     ) -> Union[Tuple, Seq2SeqModelOutputWithLatent]:
-
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1568,6 +1586,7 @@ class BartModelWithLangevin(BartPretrainedModel, LatentModel):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
+                # select_knowledge_index=select_knowledge_index, # Ours
             )
 
         # If the user passed a tuple for encoder_outputs, we wrap it in a BaseModelOutput when return_dict=True
@@ -1623,15 +1642,35 @@ class BartModelWithLangevin(BartPretrainedModel, LatentModel):
             classification_logits += decoder_cls_mask
         # kn_select_index = torch.argmax(classification_logits.unsqueeze(-1), dim=1).unsqueeze(-1)  # bsz x 1 x 1
         top_k = min(self.top_k_kn, n_kns) if self.training else 1
-        kn_select_index = torch.topk(classification_logits, top_k, dim=1).indices.unsqueeze(-1)  # bsz x top_k x 1
-        if self.oracle:
-            # TODO: new code for oracle
-            # print("kn_select_index", kn_select_index, kn_select_index.shape)
-            new_kn_select_index = torch.tensor([[[0]]], dtype=kn_select_index.dtype, device=kn_select_index.device)
-            # print("new_kn_select_index", new_kn_select_index, new_kn_select_index.shape)
-            # input()
-            kn_select_index = new_kn_select_index
-            # TODO: new code for oracle - UNTIL HERE
+
+
+
+        """
+        改変部
+        ここで出力ロジットが最大の知識を１つ選択している
+        classification_logitは一致している
+        多分、選択した知識のインデックス以外をマスクするようになっているから、スコアに応じて選択するインデックスを変更するだけでいい
+        [[[2]]]
+
+        元は以下の１行のみ
+        """
+
+        # 元々の知識選択
+        # kn_select_index = torch.topk(classification_logits, top_k, dim=1).indices.unsqueeze(-1)  # bsz x top_k x 1
+
+        # 指定した知識を選択する
+        kn_select_idx_int = select_knowledge_index.tolist()
+        if kn_select_idx_int == -1:
+            kn_select_index = torch.topk(classification_logits, top_k, dim=1).indices.unsqueeze(-1)
+        else:
+            kn_select_index = torch.tensor([kn_select_idx_int], device=classification_logits.device).unsqueeze(-1).unsqueeze(0)
+        # print("\n\nttt")
+        # print(kn_select_index)
+
+
+        """
+        ここまで
+        """
 
         # Ours: Forward for Prior Model
         # Latent model forward here
@@ -1655,11 +1694,11 @@ class BartModelWithLangevin(BartPretrainedModel, LatentModel):
             # The original shape of attention mask: (bsz * 1) x seq_len -> bsz x seq_len
             attention_mask = ctx_attention_mask
             attention_mask = attention_mask.view(-1, seq_len)
-
         else:
             # The original shape of attention mask: (bsz * num_kn) x seq_len -> bsz x num_kn x seq_len
             attention_mask = attention_mask.view(-1, n_kns, seq_len)
             attention_mask = torch.gather(attention_mask, dim=1, index=enc_kn_select_index).squeeze(1)
+
 
         if ctx_outputs is not None:
             encoder_hidden_states = ctx_outputs
@@ -1670,8 +1709,8 @@ class BartModelWithLangevin(BartPretrainedModel, LatentModel):
             # The original shape of hidden states: (bsz * num_kn) x seq_len x hdim -> bsz x num_kn x seq_len x hdim 
             encoder_hidden_states = encoder_hidden_states.view(-1, n_kns, seq_len, hdim)
             encoder_hidden_states = torch.gather(encoder_hidden_states, dim=1,
-                                                 index=enc_kn_select_index.unsqueeze(-1).expand(-1, -1, -1,
-                                                                                                hdim)).squeeze(1)
+                                                    index=enc_kn_select_index.unsqueeze(-1).expand(-1, -1, -1,
+                                                                                                    hdim)).squeeze(1)
 
         # Also select the corresponding z
         # The original shape of z: (bsz * num_kn) x hdim -> bsz x num_kn x hdim
@@ -1767,7 +1806,6 @@ class BartModelWithLangevin(BartPretrainedModel, LatentModel):
         classification_logits = encoder_outputs[1]
         if not return_dict:
             return (kl_loss, classification_logits,) + decoder_outputs + encoder_outputs[6:]
-
         return Seq2SeqModelOutputWithLatent(
             kl_loss=kl_loss,
             classification_logits=classification_logits,
@@ -1794,13 +1832,10 @@ class BartForConditionalGenerationWithLangvegin(BartForConditionalGenerationWith
         self.g_l_steps      = config.g_l_steps
         self.g_l_step_size  = config.g_l_step_size
         self.verbose        = config.verbose
-        self.remove_noise   = config.remove_noise
         self.add_z_mse      = config.add_z_mse
         self.gen_with_noise = config.gen_with_noise
         self.pseudo_confidence = config.pseudo_confidence
         self.pseudo_label_only = config.pseudo_label_only
-        self.random_choice  = config.random_choice
-        self.categorical_prior = config.categorical_prior
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1833,6 +1868,7 @@ class BartForConditionalGenerationWithLangvegin(BartForConditionalGenerationWith
         decoder_shapes: Optional[tuple] = None,
         vae_kl_weight: Optional[float] = 1.0,
         decoder_cls_mask: Optional[torch.Tensor] = None,
+        select_knowledge_index: Optional[torch.Tensor] = None, # Ours
     ) -> Union[Tuple, Seq2SeqLMOutputWithLatent]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -1853,9 +1889,9 @@ class BartForConditionalGenerationWithLangvegin(BartForConditionalGenerationWith
                     labels, self.config.pad_token_id, self.config.decoder_start_token_id
                 )
 
+
         if ctx_input_ids is not None and (self.no_kn_decode or self.model.learn_prior):
             assert ctx_input_ids is not None, "ctx_input_ids is None :("
-
             ctx_outputs = self.model.encoder(
                 input_ids=ctx_input_ids,
                 attention_mask=ctx_attention_mask,
@@ -1884,10 +1920,11 @@ class BartForConditionalGenerationWithLangvegin(BartForConditionalGenerationWith
             ctx_attention_mask=ctx_attention_mask,
             decoder_shapes=decoder_shapes,
             decoder_cls_mask=decoder_cls_mask,
+            select_knowledge_index=select_knowledge_index,
         )
 
 
-        def top_k_selection(encoder_outputs, labels, random=False):
+        def top_k_selection(encoder_outputs, labels):
             z = encoder_outputs[2].unsqueeze(2)
             attention_mask = encoder_outputs[3]
             encoder_hidden_states = encoder_outputs[6]
@@ -1939,24 +1976,11 @@ class BartForConditionalGenerationWithLangvegin(BartForConditionalGenerationWith
                 # print("TopK: lm_loss before       |", masked_lm_loss)
                 masked_lm_loss -= encoder_outputs.classification_mask
                 # print("TopK: cls_mask             |", encoder_outputs.classification_mask)
-            
-            neg_likelihood = masked_lm_loss.detach()
-            if self.categorical_prior:
-                classification_logits = encoder_outputs.classification_logits.detach()
-                neg_likelihood -= classification_logits
-            if random:
-                probs = nn.functional.softmax(neg_likelihood * -1, dim=1) 
-                # print("neg_likelihood |", neg_likelihood, neg_likelihood.shape)
-                # print("probs          |", probs, probs.shape)
-                min_ce_index = probs.multinomial(num_samples=1, replacement=True).unsqueeze(-1)
-            else:
-                min_ce_index = torch.argmin(neg_likelihood, dim=1, keepdim=True).unsqueeze(-1)
-
+            min_ce_index = torch.argmin(masked_lm_loss, dim=1, keepdim=True).detach().unsqueeze(-1)
             classification_idx  = encoder_outputs.classification_idx
             # print("TopK: lm_loss              |", masked_lm_loss)
-            # print("TopK: lm_loss              |", masked_lm_loss.shape)
-            # print("TopK: min_ce_index         |", min_ce_index, min_ce_index.shape)
-            # print("TopK: argmin               |", torch.argmin(neg_likelihood, dim=1, keepdim=True).unsqueeze(-1))
+            # print("TopK: argmin               |", masked_lm_loss.shape)
+            # print("TopK: argmin               |", min_ce_index, min_ce_index.shape)
             # print("TopK: classification_idx   |", classification_idx, classification_idx.shape)
 
             # Select z based on ce loss
@@ -1979,46 +2003,6 @@ class BartForConditionalGenerationWithLangvegin(BartForConditionalGenerationWith
             encoder_outputs.attention_mask    = attention_mask
             encoder_outputs.last_hidden_state = encoder_hidden_states
             return encoder_outputs, pseudo_labels
-
-
-        # def random_selection(encoder_outputs):
-        #     classification_logits = encoder_outputs[1]
-        #     z = encoder_outputs[2].unsqueeze(2)
-        #     attention_mask = encoder_outputs[3]
-        #     encoder_hidden_states = encoder_outputs[6]
-
-        #     bsz, top_k, hdim = z.shape[0], z.shape[1], z.shape[3]
-        #     classification_idx  = encoder_outputs.classification_idx
-        #     # print("classification_idx     |", classification_idx.shape)
-        #     # print("classification_logits  |", classification_logits.shape)
-        #     probs = torch.gather(classification_logits, dim=1, index=classification_idx.squeeze(-1)).detach()
-        #     probs = nn.functional.softmax(probs, dim=1)
-        #     min_ce_index = probs.multinomial(num_samples=1, replacement=True).unsqueeze(-1)
-
-        #     # print("TopK: probs                |", probs)
-        #     # print("TopK: min_ce_index         |", min_ce_index, min_ce_index.shape)
-        #     # print("TopK: classification_idx   |", classification_idx, classification_idx.shape)
-
-        #     # Select z based on ce loss
-        #     cls_min_ce_index = min_ce_index.expand(-1, -1, attention_mask.shape[-1])
-        #     attention_mask = torch.gather(attention_mask, dim=1, index=cls_min_ce_index).squeeze(1)
-        #     encoder_hidden_states = torch.gather(encoder_hidden_states, dim=1,
-        #                                          index=cls_min_ce_index.unsqueeze(-1).expand(-1, -1, -1,
-        #                                                                                      hdim)).squeeze(1)
-        #     pseudo_labels = torch.gather(classification_idx, dim=1, index=min_ce_index).squeeze(1)
-        #     z = torch.gather(z, dim=1, index=min_ce_index.unsqueeze(-1).expand(-1, -1, -1, hdim)).squeeze(1)
-
-        #     # print("TopK: z                     |", z.shape)
-        #     # print("TopK: attention_mask        |", attention_mask.shape)
-        #     # print("TopK: encoder_hidden_states |", encoder_hidden_states.shape)
-        #     # print("TopK: pseudo_labels         |", pseudo_labels, pseudo_labels.shape)
-        #     # print("-"*80)
-        #     # input()
-
-        #     encoder_outputs.z                 = z
-        #     encoder_outputs.attention_mask    = attention_mask
-        #     encoder_outputs.last_hidden_state = encoder_hidden_states
-        #     return encoder_outputs, pseudo_labels
 
 
         # g_l_steps: total steps of langevin sampling   (self.g_l_steps)
@@ -2073,9 +2057,7 @@ class BartForConditionalGenerationWithLangvegin(BartForConditionalGenerationWith
 
                 z.data = z.data - 0.5 * self.g_l_step_size * self.g_l_step_size * (z_grad_g + z_grad_e)
                 #z.data = z.data
-                # TODO not adding noise here
-                if not self.remove_noise:
-                    z.data += self.g_l_step_size * torch.randn_like(z).data
+                z.data += self.g_l_step_size * torch.randn_like(z).data
 
                 z_grad_g_grad_norm = z_grad_g.view(bsz, -1).norm(dim=1).mean()
                 #z_grad_g_grad_norm = 0 
@@ -2090,7 +2072,7 @@ class BartForConditionalGenerationWithLangvegin(BartForConditionalGenerationWith
         # Ours: second step knowledge selection
         # Get top-k candidates and select k^* which has the lowest CE loss with response
         if labels is not None and self.training and self.model.top_k_kn > 1:
-            encoder_outputs, pseudo_labels = top_k_selection(encoder_outputs, labels, random=self.random_choice)
+            encoder_outputs, pseudo_labels = top_k_selection(encoder_outputs, labels)
         else:
             pseudo_labels = None
 
@@ -2203,7 +2185,8 @@ class BartForConditionalGenerationWithLangvegin(BartForConditionalGenerationWith
         cross_attn_head_mask=None,
         use_cache=None,
         encoder_outputs=None,
-        **kwargs
+        select_knowledge_index=None, # Ours
+        **kwargs,
     ):
         # cut decoder_input_ids if past is used
         if past is not None:
@@ -2235,6 +2218,7 @@ class BartForConditionalGenerationWithLangvegin(BartForConditionalGenerationWith
             "knowledge_mask": knowledge_mask,
             "ctx_input_ids": ctx_input_ids,
             "ctx_attention_mask": ctx_attention_mask,
+            "select_knowledge_index": select_knowledge_index, # Ours
         }
 
 

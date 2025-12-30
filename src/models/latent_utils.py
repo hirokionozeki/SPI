@@ -49,15 +49,11 @@ class LatentModel(nn.Module):
         # loss_kl = 0.5 * (mu.pow(2) + logvar.exp() - logvar - 1)
         # mean1 and logvar1 are from posterior
         # mean2 and logvar2 are from prior
-        # TODO what is dim_target_kl
         exponential = logvar1 - logvar2 - torch.pow(mean1 - mean2, 2) / logvar2.exp() - torch.exp(logvar1 - logvar2) + 1
         loss_kl = -0.5 * torch.sum(exponential, tuple(range(1, len(exponential.shape))))
 
         kl_mask = (loss_kl > dim_target_kl).float()
-        # TODO double check here: how the average should be done
-        # print("Loss KL before mean", kl_mask * loss_kl, loss_kl.shape)
         loss_kl = (kl_mask * loss_kl).mean()
-        # print("Loss KL", loss_kl, loss_kl.shape, loss_kl)
         return loss_kl
     
     def compute_loss(self):
@@ -75,7 +71,6 @@ def convert_mask(mask: torch.Tensor, dtype: torch.dtype):
 
 
 class AverageSelfAttention(nn.Module):
-    """This fuction is modified from https://github.com/fangleai/TransformerCVAE/blob/master/model.py#L58"""
     def __init__(self, attention_size):
         super(AverageSelfAttention, self).__init__()
         w = torch.empty(attention_size)
